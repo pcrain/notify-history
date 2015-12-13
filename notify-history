@@ -1,9 +1,14 @@
 #!/usr/bin/python
 #Tracks and prints notification history
 
+#########
+#Imports#
+#########
 import os, signal, subprocess, time, atexit, binascii, re, datetime, argparse, sys
 
-# Colors
+########
+#Colors#
+########
 class col:
   BLN   =   '\033[0m'            # Blank
   UND   =   '\033[1;4m'          # Underlined
@@ -18,40 +23,60 @@ class col:
   CYN   =   '\033[1;36m'         # Cyan
   WHT   =   '\033[1;37m'         # White
 
-#Constants
-cmd = ["dbus-monitor", "interface='org.freedesktop.Notifications'"]
+####################
+#User-set Constants#
+####################
 logfile = "/tmp/nd-logger.logfile" #File where we store our logs
 pidfile = "/tmp/nd-logger.pid"
 
+#############################
+#Immutable, global constants#
+#############################
+#Command to run dbus-monitor
+CMD = ["dbus-monitor", "interface='org.freedesktop.Notifications'"]
+#The name of this program
 SELFSTRING = "notify-history-simulator"
+#Programs for which we should not capture output
 SKIPLIST = [
   SELFSTRING,  #Skip recording outself
   "mynotice",  #Skip recording my notice script
   "ignore",
   "hidden",
 ]
+#Regex to skip over semicolons in quotes
+SEMICOLON = re.compile(r'''((?:[^;"']|"[^"]*"|'[^']*')+)''')
+#Regex to skip over colons in quotes
+COLONSPLIT = re.compile(r'''((?:[^:"']|"[^"]*"|'[^']*')+)''')
+#Regex to skip over spaces in quotes
+SPACESPLIT = re.compile(r'''((?:[^\ "']|"[^"]*"|'[^']*')+)''')
 
-#Other Globals
-_color=col.YLW
-_printing=False
-_snum=0
+###############
+#Other Globals#
+###############
+_color=col.YLW       #Current global color we're printing in
+_printing=False      #Whether we're printing (dbus entry is from desktop notifications) or not
+_snum=0              #Number of strings we've encountered so far
 _nprint=10           #Number of messages to print
 _sleeptime=0.2       #Time between messages
-_persist=False
-_quiet=False
-_simulate=False
-_skipself=False
-_lasttime=0
-_showtime=3000
-_curstring=""
-_midstring=False
+_persist=False       #When true, simulated notifications persist on screen until dismissed
+_quiet=False         #When true, the notification history daemon prints only error messages
+_simulate=False      #When true, display recent notifications as actual notifications (false = stdout)
+_skipself=False      #Whether we should skip the current notification
+_lasttime=0          #Timestamp of the last notification recorded
+_showtime=3000       #Time to display each notification in simulation mode
+_curstring=""        #Current multiline string we're parsing
+_midstring=False     #Whether our scanner is currently in the middle of a multiline string
 
-#Defs
-#Courtesy of http://stackoverflow.com/questions/788411/check-to-see-if-python-script-is-running
+######
+#Defs#
+######
+#Send signall /sig/ to process with pid /pid/
 def sig_pid(pid,sig):
+  #Courtesy of http://stackoverflow.com/questions/788411/check-to-see-if-python-script-is-running
   try:             os.kill(pid, sig)
   except OSError:  return
   else:            return pid
+#Try to open the pidfile for any currently-running notify-history daemon, exiting if it's an active process
 def write_pidfile_or_die(path_to_pidfile):
   if os.path.exists(path_to_pidfile):
     pid = int(open(path_to_pidfile).read())
@@ -65,6 +90,7 @@ def write_pidfile_or_die(path_to_pidfile):
       os.remove(path_to_pidfile)
   open(path_to_pidfile, 'w').write(str(os.getpid()))
   return path_to_pidfile
+#Execute the command /command/ in a subprocess, logging its output to the global logfile
 def execute(command):
   global _log
   pro = subprocess.Popen(command, stdout=subprocess.PIPE)
@@ -75,187 +101,200 @@ def execute(command):
   for line in lines_iterator:
     parseline(line.decode('ascii'))
   _log.close()
+#Print pretty text on the string with the global color, writing the uncolored text to a log
 def pprint(t,s,i=0):
   global _log, _firstline, _color
   #Don't print anything simulated
-  if _skipself:
-    return
   if not _quiet and sys.stdout.isatty():
     print(" "*i + _color + t + ": " + s + col.BLN)
+  if _skipself:
+    return
   if i == 0:
     _log.write("\n")
   _log.write(t+":"+s+";")
   _log.flush()
-def filter(string):
-  return string.replace("\n","\\n") #.replace("<","&lt;").replace(">","&gt;").replace("&","&amp;")
+#Replace newlines (and special HTML characters) with more innocuous characters
+def filterstring(string): return string.replace("\n","\\n") #.replace("<","&lt;").replace(">","&gt;").replace("&","&amp;")
+#Print and log a single line
+def logline(line):
+  global _snum, _color, _skipself, _curstring, _midstring
+  m = re.search('^[\ ]*string\ \"([^\"]*[^\"])$', line)
+  #If there's no closing quote, it's a multiline string!
+  if m:
+    _midstring = True
+    _curstring += m.group(1)
+    return
+  m = re.search('string\ \"(.*)\"', line)
+  if m:
+    _snum += 1
+    if _snum == 1:
+      if m.group(1) in SKIPLIST:
+        _skipself=True
+        _color=col.BLK
+      else:
+        _color=col.CYN
+      pprint("TIME",_lasttime)
+      _color=col.YLW
+      pprint("CALLER",m.group(1),2)
+    elif _snum == 2:
+      pprint("ICON",m.group(1),2)
+    elif _snum == 3:
+      pprint("TITLE",'"'+filterstring(m.group(1))+'"',2)
+    elif _snum == 4:
+      pprint("BODY",'"'+filterstring(m.group(1))+'"',2)
+  m = re.search('.*variant.*byte\ (.)', line)
+  if m:
+    pprint ("URGENCY",m.group(1),2)
+  m = re.search('.*variant.*string\ \"(.*)\"', line)
+  if m:
+    pprint ("CATEGORY",m.group(1),2)
+  m = re.search('[\ ]+int32\ ([0-9-]*)', line)
+  if m:
+    pprint ("LENGTH",m.group(1),2)
+#Print and log a continued multiline
+def logmultiline(line):
+  global _snum, _curstring, _midstring
+  m = re.search('^([^\"]*)\"$', line)
+  if m:
+    _curstring += m.group(1)
+    _midstring = False
+    _snum += 1
+    pprint("BODY",'"'+filterstring(_curstring)+'"',2)
+    _curstring=""
+  else:
+    _curstring += line
+#Scan and parse each relevant line from the dbus-monitor, recording to the logfile when necessary
 def parseline(line):
-  global _printing, _snum, _color, _skipself, _lasttime, _curstring, _midstring
+  global _printing, _snum, _color, _skipself, _lasttime
   if not _printing:
     m = re.search('member=Notify', line)
-    if m:
+    if m: #This regex signifies the beginning of a desktop notification entry
       time = re.search('time=([0-9\.]*)', line).group(1)
       basetime = time.split(".")
       _lasttime = datetime.datetime.fromtimestamp(int(basetime[0])).strftime('%Y-%m-%d-%H-%M-%S') + "-" + basetime[1]
       _printing=True
   else:
     m = re.search('signal\ time|method\ call', line)
-    if m:
+    if m: #This regex signifies the end of a desktop notification entry
       _printing=False
       _skipself=False
       _snum=0
   if _printing:
     _color=col.YLW
     if _midstring:
-      m = re.search('^([^\"]*)\"$', line)
-      if m:
-        _curstring += m.group(1)
-        _midstring = False
-        _snum += 1
-        pprint("BODY",'"'+filter(_curstring)+'"',2)
-        _curstring=""
-      else:
-        _curstring += line
+      logmultiline(line)
     else:
-      m = re.search('^[\ ]*string\ \"([^\"]*[^\"])$', line)
-      if m:
-        _midstring = True
-        _curstring += m.group(1)
-        return
-      m = re.search('string\ \"(.*)\"', line)
-      if m:
-        _snum += 1
-        if _snum == 1:
-          if m.group(1) in SKIPLIST:
-            _skipself=True
-          _color=col.CYN
-          pprint("TIME",_lasttime)
-          _color=col.YLW
-          pprint("CALLER",m.group(1),2)
-        elif _snum == 2:
-          pprint("ICON",m.group(1),2)
-        elif _snum == 3:
-          pprint("TITLE",'"'+filter(m.group(1))+'"',2)
-        elif _snum == 4:
-          pprint("BODY",'"'+filter(m.group(1))+'"',2)
-      m = re.search('.*variant.*byte\ (.)', line)
-      if m:
-        pprint ("URGENCY",m.group(1),2)
-      m = re.search('.*variant.*string\ \"(.*)\"', line)
-      if m:
-        pprint ("CATEGORY",m.group(1),2)
-      m = re.search('[\ ]+int32\ ([0-9-]*)', line)
-      if m:
-        pprint ("LENGTH",m.group(1),2)
+      logline(line)
+#Build a notify-send command out of the parts of a logfile entry
+def buildCommandList(fields):
+  length = -1; urg = 1; icon = ""; b = ""; cat = ""; summ = ""; app = SELFSTRING
+  cmdlist=["notify-send"]
+  for p in fields:
+    p = COLONSPLIT.split(p)[1::2]
+    if (len(p) < 2):                 continue
+    if p[0] == "ICON":               icon    = p[1]
+    elif p[0] == "TITLE":            summ    = p[1].replace('\\n', '\n')
+    elif p[0] == "BODY" and not b:   b       = p[1].replace('\\n', '\n')
+    elif p[0] == "CATEGORY":         cat     = p[1]
+    elif p[0] == "URGENCY":          urg     = p[1]
+    elif p[0] == "LENGTH":           length  = p[1]
+  if icon:                         cmdlist.extend(["-i",icon])
+  if cat:                          cmdlist.extend(["-c",cat])
+  if _showtime > 0:                cmdlist.extend(["-t",str(_showtime)])
+  elif length and length != "-1":  cmdlist.extend(["-t",length])
+  if app and app != "notify-send": cmdlist.extend(["-a",app])
+  if _persist:                     cmdlist.extend(["-u","critical"])
+  if b != "" and summ != "":       cmdlist.extend([summ[1:-1],b[1:-1]])
+  elif b != '""':                  cmdlist.extend([b[1:-1]])
+  else:                            cmdlist.extend([summ[1:-1]])
+  return cmdlist
+#Display recent notifications, either in the terminal or with real notifications
 def display(simulate):
+  #If we have no logfile, we can't display our log!
   if not os.path.exists(logfile):
     print(col.WHT + "No recent notifications to show!")
     sys.exit()
-  #Skips over semicolons in quotes
-  SEMICOLON = re.compile(r'''((?:[^;"']|"[^"]*"|'[^']*')+)''')
-  #Skips over colons in quotes
-  COLONSPLIT = re.compile(r'''((?:[^:"']|"[^"]*"|'[^']*')+)''')
-  #Skips over spaces in quotes
-  SPACESPLIT = re.compile(r'''((?:[^\ "']|"[^"]*"|'[^']*')+)''')
-  firstpass = True
+  #Get our messages from the logfile
   with open(logfile, 'r') as log:
     messages = log.readlines();
+  #Display the last /_nprint/ messages
   print(col.WHT + "Displaying last " + str(_nprint) + " messages..." + col.BLN)
   for m in reversed(messages[-_nprint:]):
+    #Skip empty lines
     if not m == "\n":
-      firstpass = False
-      m = m.strip()
-      parts = SEMICOLON.split(m)[1::2]
+      #Split each log entry at its semicolons and get a list of parts
+      fields = SEMICOLON.split(m.strip())[1::2]
+      #If we're simulating actual notifications
       if simulate:
-        if not firstpass:
-          time.sleep(_sleeptime)
-        length = -1; urg = 1
-        icon = ""; body = ""; cat = ""
-        summary = ""; app = SELFSTRING
-        for p in parts:
-          p = COLONSPLIT.split(p)[1::2]
-          # print(p)
-          # p = p.split(":",1)
-          #We set the caller to ourselves to avoid capturing it with the daemon
-          # if   p[0] == "CALLER":   app     = p[1]
-          if (len(p) > 1):
-            if p[0] == "ICON":       icon    = p[1]
-            elif p[0] == "TITLE":    summary = p[1].replace('\\n', '\n')
-            elif p[0] == "BODY":
-              if not body: body    = p[1].replace('\\n', '\n')
-            elif p[0] == "CATEGORY": cat     = p[1]
-            elif p[0] == "URGENCY":  urg     = p[1]
-            elif p[0] == "LENGTH":   length  = p[1]
-        cmdlist=[]
-        cmdlist.append("notify-send")
-        if icon:                         cmdlist.extend(["-i",icon])
-        if cat:                          cmdlist.extend(["-c",cat])
-        if _showtime > 0:                 cmdlist.extend(["-t",str(_showtime)])
-        elif length and length != "-1":    cmdlist.extend(["-t",length])
-        if app and app != "notify-send": cmdlist.extend(["-a",app])
-        # if _persist or urg == "2":       cmdlist.extend(["-u","critical"])
-        # elif urg == "0":                 cmdlist.extend(["-u","low"])
-        if body != "" and summary != "":
-          cmdlist.extend([summary[1:-1],body[1:-1]])
-        elif body != '""':
-          cmdlist.extend([body[1:-1]])
-        else:
-          cmdlist.extend([summary[1:-1]])
-        #Call notify-send with the collected data
+        time.sleep(_sleeptime)
+        #Build our notify-send command
+        cmdlist=buildCommandList(fields)
+        #Print out the command we'll be executing for debug purposes
         print(' '.join(cmdlist))
+        #Call notify-send with the collected data
         subprocess.Popen(cmdlist, stdout=subprocess.PIPE)
+      #If we're just printing to the command line
       else:
-        for p in parts:
+        for p in fields:
           p = p.split(":",1)
           if p[0] == "TIME":
             print(col.CYN + p[0] + ": " + p[1] + col.BLN)
           else:
             print("  " + col.YLW + p[0] + ": " + p[1] + col.BLN)
+#Configure command line arguments for the parser
+def configParser():
+  parser = argparse.ArgumentParser()
+  mode = parser.add_mutually_exclusive_group()
+  mode.add_argument("-d", "--daemon",   help="collect mode",                       action="store_true")
+  mode.add_argument("-k", "--kill",     help="kill the currently running daemon",  action="store_true")
+  mode.add_argument("-p", "--prints",   help="print mode",                         action="store_true")
+  mode.add_argument("-s", "--simulate", help="simulate mode",                      action="store_true")
+  mode.add_argument("-c", "--clear",    help="clear the logfile",                  action="store_true")
+  parser.add_argument("-q", "--quiet",  help="run quietly",                        action="store_true")
+  parser.add_argument("--persist",      help="don't close messages until clicked", action="store_true")
+  parser.add_argument("-n", type=int,   help="max number of messages to show")
+  parser.add_argument("-w", type=int,   help="time in ms between messages")
+  parser.add_argument("-t", type=int,   help="time in ms to show each message")
+  return parser
 
-#Go
-parser = argparse.ArgumentParser()
-mode = parser.add_mutually_exclusive_group()
-mode.add_argument("-d", "--daemon",   help="collect mode",                       action="store_true")
-mode.add_argument("-k", "--kill",     help="kill the currently running daemon",  action="store_true")
-mode.add_argument("-p", "--prints",   help="print mode",                         action="store_true")
-mode.add_argument("-s", "--simulate", help="simulate mode",                      action="store_true")
-mode.add_argument("-c", "--clear",    help="clear the logfile",                  action="store_true")
-parser.add_argument("-q", "--quiet",  help="run quietly",                        action="store_true")
-parser.add_argument("--persist",      help="don't close messages until clicked", action="store_true")
-parser.add_argument("-n", type=int,   help="max number of messages to show")
-parser.add_argument("-w", type=int,   help="time in ms between messages")
-parser.add_argument("-t", type=int,   help="time in ms to show each message")
-args = parser.parse_args()
-
-if args.n:
-  _nprint = args.n
-if args.w:
-  _sleeptime = args.w/1000
-if args.t:
-  _showtime = args.t
-if args.persist:
-  _persist = True
-if args.quiet:
-  _quiet = True
-
-if args.kill:
-  if sig_pid(int(open(pidfile).read()),9):
-    print(col.WHT + "Daemon killed!" + col.BLN)
+##############
+#Main Program#
+##############
+def main():
+  global _nprint, _sleeptime, _showtime, _persist, _quiet, _simulate
+  parser = configParser()
+  args = parser.parse_args()
+  if args.n:
+    _nprint = args.n
+  if args.w:
+    _sleeptime = args.w/1000
+  if args.t:
+    _showtime = args.t
+  if args.persist:
+    _persist = True
+  if args.quiet:
+    _quiet = True
+  if args.kill:
+    if sig_pid(int(open(pidfile).read()),9):
+      print(col.WHT + "Daemon killed!" + col.BLN)
+    else:
+      print(col.WHT + "Nothing to kill!" + col.BLN)
+    sys.exit()
+  if args.clear:
+    #Don't allow this with a running daemon
+    write_pidfile_or_die(pidfile)
+    print(col.WHT + "Clearing all logged notifications" + col.BLN)
+    os.remove(logfile)
+  elif args.prints:
+    display(False)
+  elif args.simulate:
+    _simulate=True
+    display(True)
+  elif args.daemon:
+    #Don't allow multiple instances of the daemon
+    write_pidfile_or_die(pidfile)
+    execute(CMD)
   else:
-    print(col.WHT + "Nothing to kill!" + col.BLN)
-  sys.exit()
-if args.clear:
-  #Don't allow this with a running daemon
-  write_pidfile_or_die(pidfile)
-  print(col.WHT + "Clearing all logged notifications" + col.BLN)
-  os.remove(logfile)
-elif args.prints:
-  display(False)
-elif args.simulate:
-  _simulate=True
-  display(True)
-elif args.daemon:
-  #Don't allow multiple instances of the daemon
-  write_pidfile_or_die(pidfile)
-  execute(cmd)
-else:
-  parser.print_help()
+    parser.print_help()
+if __name__ == "__main__":
+  main()
