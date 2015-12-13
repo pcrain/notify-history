@@ -26,8 +26,8 @@ class col:
 ####################
 #User-set Constants#
 ####################
-logfile = "/tmp/nd-logger.logfile" #File where we store our logs
-pidfile = "/tmp/nd-logger.pid"
+LOGFILE = "/tmp/nd-logger.logfile" #File where we store our logs
+PIDFILE = "/tmp/nd-logger.pid"
 
 #############################
 #Immutable, global constants#
@@ -95,11 +95,11 @@ def execute(command):
   global _log
   pro = subprocess.Popen(command, stdout=subprocess.PIPE)
   lines_iterator = iter(pro.stdout.readline, b"")
-  _log = open(logfile, 'a+')
+  _log = open(LOGFILE, 'a+')
   if not _quiet:
     print(col.WHT + "Logging started!" + col.BLN)
   for line in lines_iterator:
-    parseline(line.decode('ascii'))
+    parseline(line.decode('utf-8'))
   _log.close()
 #Print pretty text on the string with the global color, writing the uncolored text to a log
 def pprint(t,s,i=0):
@@ -114,7 +114,9 @@ def pprint(t,s,i=0):
   _log.write(t+":"+s+";")
   _log.flush()
 #Replace newlines (and special HTML characters) with more innocuous characters
-def filterstring(string): return string.replace("\n","\\n") #.replace("<","&lt;").replace(">","&gt;").replace("&","&amp;")
+def filterstring(string):
+  s = string.replace("\n","\\n") #.replace("<","&lt;").replace(">","&gt;").replace("&","&amp;")
+  return s
 #Print and log a single line
 def logline(line):
   global _snum, _color, _skipself, _curstring, _midstring
@@ -211,11 +213,11 @@ def buildCommandList(fields):
 #Display recent notifications, either in the terminal or with real notifications
 def display(simulate):
   #If we have no logfile, we can't display our log!
-  if not os.path.exists(logfile):
+  if not os.path.exists(LOGFILE):
     print(col.WHT + "No recent notifications to show!")
     sys.exit()
   #Get our messages from the logfile
-  with open(logfile, 'r') as log:
+  with open(LOGFILE, 'r') as log:
     messages = log.readlines();
   #Display the last /_nprint/ messages
   print(col.WHT + "Displaying last " + str(_nprint) + " messages..." + col.BLN)
@@ -275,16 +277,16 @@ def main():
   if args.quiet:
     _quiet = True
   if args.kill:
-    if sig_pid(int(open(pidfile).read()),9):
+    if sig_pid(int(open(PIDFILE).read()),9):
       print(col.WHT + "Daemon killed!" + col.BLN)
     else:
       print(col.WHT + "Nothing to kill!" + col.BLN)
     sys.exit()
   if args.clear:
     #Don't allow this with a running daemon
-    write_pidfile_or_die(pidfile)
+    write_pidfile_or_die(PIDFILE)
     print(col.WHT + "Clearing all logged notifications" + col.BLN)
-    os.remove(logfile)
+    os.remove(LOGFILE)
   elif args.prints:
     display(False)
   elif args.simulate:
@@ -292,7 +294,7 @@ def main():
     display(True)
   elif args.daemon:
     #Don't allow multiple instances of the daemon
-    write_pidfile_or_die(pidfile)
+    write_pidfile_or_die(PIDFILE)
     execute(CMD)
   else:
     parser.print_help()
