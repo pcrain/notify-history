@@ -5,6 +5,7 @@
 #Imports#
 #########
 import os, signal, subprocess, time, atexit, binascii, re, datetime, argparse, sys
+import array, struct, string,random
 
 ########
 #Colors#
@@ -49,6 +50,18 @@ SEMICOLON = re.compile(r'''((?:[^;"']|"[^"]*"|'[^']*')+)''')
 COLONSPLIT = re.compile(r'''((?:[^:"']|"[^"]*"|'[^']*')+)''')
 #Regex to skip over spaces in quotes
 SPACESPLIT = re.compile(r'''((?:[^\ "']|"[^"]*"|'[^']*')+)''')
+#TARGA file constants (see http://gpwiki.org/index.php/TGA)
+TGA_StructFmt    = "<BBBHHBHHHHBB"
+TGA_Offset       = 0
+TGA_ColorType    = 0
+TGA_ImageType    = 2
+TGA_PaletteStart = 0
+TGA_PaletteLen   = 0
+TGA_PalBits      = 8
+TGA_XOrigin      = 0
+TGA_YOrigin      = 0
+TGA_BPP          = 32
+TGA_Orientation  = 0
 
 ###############
 #Other Globals#
@@ -66,6 +79,11 @@ _lasttime=0          #Timestamp of the last notification recorded
 _showtime=3000       #Time to display each notification in simulation mode
 _curstring=""        #Current multiline string we're parsing
 _midstring=False     #Whether our scanner is currently in the middle of a multiline string
+_midarray=False      #Whether our scanner is currently in the middle of a multiline byte array
+_imagex=0            #X-dimension for the image in the image hint
+_imagey=0            #Y-dimension for the image in the image hint
+_icondata=False      #Whether we're currently looking at icon_data
+_iconintdata=[]      #Integer data for icon_data (Format: [x,y,stride,8,bytes per color])
 
 ######
 #Defs#
@@ -119,13 +137,25 @@ def filterstring(string):
   return s
 #Print and log a single line
 def logline(line):
-  global _snum, _color, _skipself, _curstring, _midstring
-  m = re.search('^[\ ]*string\ \"([^\"]*[^\"])$', line)
-  #If there's no closing quote, it's a multiline string!
-  if m:
-    _midstring = True
-    _curstring += m.group(1)
-    return
+  global _snum, _color, _skipself, _curstring, _midstring, _midarray, _icondata
+  if _icondata:
+    m = re.search('^[\ ]*array\ of\ bytes\ \[[\ ]*$', line)
+    #If there's an array of bytes, it's a multiline byte array!
+    if m:
+      _midarray = True
+      return
+  else:
+    m = re.search('^[\ ]*string\ \"icon_data\"[\ ]*$', line)
+    #If we find the above string, we're looking at icon data!
+    if m:
+      _icondata = True
+      return
+    m = re.search('^[\ ]*string\ \"([^\"]*[^\"])$', line)
+    #If there's no closing quote, it's a multiline string!
+    if m:
+      _midstring = True
+      _curstring += m.group(1)
+      return
   m = re.search('string\ \"(.*)\"', line)
   if m:
     _snum += 1
@@ -152,7 +182,11 @@ def logline(line):
     pprint ("CATEGORY",m.group(1),2)
   m = re.search('[\ ]+int32\ ([0-9-]*)', line)
   if m:
-    pprint ("LENGTH",m.group(1),2)
+    if _icondata:
+      _iconintdata.extend([m.group(1)])
+      print(col.RED+"  IINT"+str(len(_iconintdata)),m.group(1))
+    else:
+      pprint ("LENGTH",m.group(1),2)
 #Print and log a continued multiline
 def logmultiline(line):
   global _snum, _curstring, _midstring
@@ -164,6 +198,29 @@ def logmultiline(line):
     pprint("BODY",'"'+filterstring(_curstring)+'"',2)
     _curstring=""
   else:
+    _curstring += line
+#Print and log a byte array
+def logbytearray(line):
+  global _curstring, _midarray, _icondata, _iconintdata
+  m = re.search('^[\ ]*\][\ ]*$', line)
+  if m:
+    _midarray = False
+    _icondata = False
+    #After logging the bytestring from dbus-monitor, strip all whitespace
+    purestring = re.sub('[\s+]', '', _curstring)
+    #Conver the string to hexadecimal
+    imagedata=bytearray.fromhex(purestring)
+    #Generate a random filename for a temporary image
+    tmpfile = "/tmp/nd-icon-"+namegen()+".tga"
+    #Save the hex data to an image
+    savedatatoimage(int(_iconintdata[0]),int(_iconintdata[1]),imagedata,tmpfile)
+    #Write the temporary file's name to the logger
+    pprint("ICON",tmpfile,2)
+    #Reset the icon's integer data and the _curstring variable
+    _iconintdata = []
+    _curstring=""
+  else:
+    #Append the current line to the hex data
     _curstring += line
 #Scan and parse each relevant line from the dbus-monitor, recording to the logfile when necessary
 def parseline(line):
@@ -183,7 +240,9 @@ def parseline(line):
       _snum=0
   if _printing:
     _color=col.YLW
-    if _midstring:
+    if _midarray:
+      logbytearray(line)
+    elif _midstring:
       logmultiline(line)
     else:
       logline(line)
@@ -258,6 +317,46 @@ def configParser():
   parser.add_argument("-w", type=int,   help="time in ms between messages")
   parser.add_argument("-t", type=int,   help="time in ms to show each message")
   return parser
+#Generate a random string of characters
+def namegen(size=6, chars=string.ascii_uppercase + string.digits):
+  s = ''.join(random.choice(chars) for _ in range(size))
+  return s
+#TGA handling code adapted from http://wiki.python.org.br//ImagemTGA
+# Author: João S. O. Bueno, adapted by Patrick Crain for notify-history
+# License: Creative Commons, Attribution Required.
+def savedatatoimage(width,height,data,fname):
+  #Swap the red and blue channels
+  for y in range(0,height):
+    for x in range(0,width):
+      o = (y * width + x) * 4
+      b = data[o]; g = data[o+1]; r = data[o+2]
+      data[o] = r
+      data[o+1] = g
+      data[o+2] = b
+  #Flip the image on its y axis
+  for y in range(0,int(height/2)):
+    for x in range(0,width):
+      top = (y          * width + x) * 4
+      bot = ((height-y-1) * width + x) * 4
+      r = data[top]; g = data[top+1]; b = data[top+2]; a = data[top+3];
+      data[top] = data[bot]
+      data[top+1] = data[bot+1]
+      data[top+2] = data[bot+2]
+      data[top+3] = data[bot+3]
+      data[bot] = r
+      data[bot+1] = g
+      data[bot+2] = b
+      data[bot+3] = a
+  #Pack the TARGA header
+  header = struct.pack(
+    TGA_StructFmt, TGA_Offset, TGA_ColorType, TGA_ImageType, TGA_PaletteStart, TGA_PaletteLen,
+    TGA_PalBits,TGA_XOrigin, TGA_YOrigin, width, height,TGA_BPP, TGA_Orientation
+  )
+  #Write the header and data to a temporary file
+  datafile = open(fname, "wb")
+  datafile.write(header)
+  datafile.write(data)
+  datafile.close()
 
 ##############
 #Main Program#
